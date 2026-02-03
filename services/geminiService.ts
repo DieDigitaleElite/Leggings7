@@ -1,122 +1,111 @@
 
 import { GoogleGenAI } from "@google/genai";
 import { APP_CONFIG } from "../constants";
-import { Product } from "../types";
 
-async function fetchWithRetry<T>(fn: () => Promise<T>, retries = 2, delay = 2000): Promise<T> {
-  try {
-    return await fn();
-  } catch (error: any) {
-    const errorMsg = error.message || "";
-    // Falls der Key nicht gefunden wurde (Requested entity not found), zwingen wir den User zur Neuauswahl
-    if (errorMsg.includes("Requested entity was not found")) {
-      throw new Error("KEY_NOT_FOUND");
-    }
-    const isRetryable = errorMsg.includes("429") || error.status === 429;
-    if (retries > 0 && isRetryable) {
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return fetchWithRetry(fn, retries - 1, delay * 2);
-    }
-    throw error;
+function getMimeType(dataUrl: string): string {
+  if (dataUrl.startsWith('data:')) {
+    const match = dataUrl.match(/^data:([^;]+);base64,/);
+    return match ? match[1] : "image/png";
   }
-}
-
-async function optimizeImage(base64: string, maxWidth = 1024): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.src = base64;
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      let width = img.width;
-      let height = img.height;
-      if (width > height) {
-        if (width > maxWidth) { height *= maxWidth / width; width = maxWidth; }
-      } else {
-        if (height > maxWidth) { width *= maxWidth / height; height = maxWidth; }
-      }
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return reject(new Error("Canvas failure"));
-      ctx.fillStyle = "white";
-      ctx.fillRect(0, 0, width, height);
-      ctx.drawImage(img, 0, 0, width, height);
-      resolve(canvas.toDataURL('image/jpeg', 0.7));
-    };
-    img.onerror = () => reject(new Error("Bild konnte nicht verarbeitet werden."));
-  });
+  return "image/png";
 }
 
 function getCleanBase64(dataUrl: string): string {
   return dataUrl.replace(/^data:[^;]+;base64,/, "");
 }
 
-export async function estimateSizeFromImage(userBase64: string, productName: string): Promise<string> {
-  return fetchWithRetry(async () => {
-    const optimized = await optimizeImage(userBase64, 800);
-    // Initialisierung direkt vor dem Call für aktuellsten API-Key
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const response = await ai.models.generateContent({
-      model: APP_CONFIG.TEXT_MODEL,
-      contents: {
-        parts: [
-          { inlineData: { data: getCleanBase64(optimized), mimeType: "image/jpeg" } },
-          { text: `Analyse the person's body type. Suggest a size (XS, S, M, L, XL, XXL) for the garment "${productName}". Output only the size code.` },
-        ],
-      },
-    });
-    const size = response.text?.trim().toUpperCase() || 'M';
-    const validSizes = ['XS', 'S', 'M', 'L', 'XL', 'XXL'];
-    return validSizes.find(s => size.includes(s)) || 'M';
-  });
-}
+export async function performVirtualTryOn(userBase64: string, productBase64: string, productName: string): Promise<string> {
+  const userMimeType = getMimeType(userBase64);
+  const productMimeType = getMimeType(productBase64);
+  
+  const cleanUserBase64 = getCleanBase64(userBase64);
+  const cleanProductBase64 = getCleanBase64(productBase64);
 
-export async function performVirtualTryOn(userBase64: string, productBase64: string, product: Product): Promise<string> {
-  return fetchWithRetry(async () => {
-    const optUser = await optimizeImage(userBase64, 1024);
-    const optProduct = await optimizeImage(productBase64, 1024);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  
+  // Maximal restriktiver Prompt für absolute Design-Treue
+  const promptText = `
+    CRITICAL TASK: Absolute High-Fidelity Virtual Try-On.
     
-    // Maximale Präzision für das Pro-Modell
-    const promptText = `
-      MANDATORY TASK: Perform a professional virtual fashion try-on.
-      USER PHOTO: Image 1.
-      PRODUCT PHOTO: Image 2.
-      
-      PRODUCT INFO: This is a TWO-PIECE SET consisting of a Top/Bra and Leggings.
-      DETAILS: ${product.description}.
-      
-      RULES:
-      1. You MUST render the person in Image 1 wearing BOTH parts of the set from Image 2.
-      2. The leggings MUST be full-length and clearly visible.
-      3. Maintain the EXACT colors, seam lines, and material texture from Image 2.
-      4. Keep the person's face, hair, and original background from Image 1 100% identical.
-      5. The outfit must fit tightly and realistically to the person's body.
-      6. Return ONLY the final high-resolution image.
-    `;
+    PRODUCT IDENTIFICATION: The product to apply is "${productName}" from the second image.
+    
+    STRICT DESIGN CONSTRAINTS (ZERO HALLUCINATION POLICY):
+    1. NO ADDITIONS: Do NOT add pockets, zippers, buttons, drawstrings, or logos that are not clearly visible in the product image. If the product is seamless/clean, the output MUST be seamless/clean.
+    2. SEAM ACCURACY: Replicate the exact seam lines, waist band height, and stitching patterns shown in the product image.
+    3. FABRIC INTEGRITY: The texture, opacity, and color saturation must match the product image exactly. 
+    4. ANATOMICAL FIT: The clothing must fit the person in the first image perfectly like a second skin, following their leg and torso shape without distorting the product's design.
+    
+    PRESERVATION RULES:
+    - Keep the user's face, hair, hands, feet, and original background 100% identical.
+    - Only replace the clothing. Ensure a clean transition at the waist, neck, and ankles.
+    
+    FINAL CHECK: Compare your generated outfit to the product image. They must be identical in structure and features.
+    
+    OUTPUT:
+    Return ONLY the image. No textual response.
+  `;
 
+  try {
     const response = await ai.models.generateContent({
-      model: APP_CONFIG.IMAGE_MODEL,
+      model: APP_CONFIG.MODEL_NAME,
       contents: {
         parts: [
-          { inlineData: { data: getCleanBase64(optUser), mimeType: "image/jpeg" } },
-          { inlineData: { data: getCleanBase64(optProduct), mimeType: "image/jpeg" } },
+          { inlineData: { data: cleanUserBase64, mimeType: userMimeType } },
+          { inlineData: { data: cleanProductBase64, mimeType: productMimeType } },
           { text: promptText },
         ],
       },
-      config: { 
-        imageConfig: { aspectRatio: "3:4", imageSize: "1K" }
+      config: {
+        temperature: 0.1, // Minimum temperature to ensure consistent, non-creative reproduction
       }
     });
 
-    if (response.candidates?.[0]?.finishReason === 'SAFETY') {
-      throw new Error("Das Bild wurde aus Sicherheitsgründen blockiert. Bitte trage auf deinem Foto neutrale Kleidung.");
+    if (!response || !response.candidates || response.candidates.length === 0) {
+      throw new Error("Die KI hat keine Antwort geliefert.");
     }
 
-    const part = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
-    if (part?.inlineData?.data) return `data:image/jpeg;base64,${part.inlineData.data}`;
-    throw new Error("KI konnte kein Bild generieren. Bitte versuche es mit einem deutlicheren Foto.");
-  });
+    const candidate = response.candidates[0];
+    
+    if (candidate.finishReason) {
+      if (candidate.finishReason === 'SAFETY') {
+        throw new Error("Das Foto wurde blockiert. Bitte nutze ein Bild mit neutralerer Pose.");
+      } else if (candidate.finishReason === 'OTHER' || (candidate.finishReason as string) === 'IMAGE_OTHER') {
+        throw new Error("Die KI konnte das Bild aufgrund technischer Einschränkungen nicht bearbeiten.");
+      }
+    }
+
+    if (!candidate.content || !candidate.content.parts) {
+      throw new Error("Ungültige Antwortstruktur der KI.");
+    }
+
+    let generatedImageUrl: string | null = null;
+    for (const part of candidate.content.parts) {
+      if (part.inlineData && part.inlineData.data) {
+        generatedImageUrl = `data:image/png;base64,${part.inlineData.data}`;
+        break;
+      }
+    }
+
+    if (!generatedImageUrl) {
+      // Try using response.text as per instructions if no inline data is found
+      const text = response.text;
+      if (text) {
+        throw new Error(`KI-Feedback: ${text}`);
+      }
+      throw new Error("Kein Bild generiert. Bitte anderes Foto versuchen.");
+    }
+
+    return generatedImageUrl;
+  } catch (error: any) {
+    console.error("Gemini Try-On Detail Error:", error);
+    
+    const errorMessage = error.message || "";
+    if (errorMessage.includes("IMAGE_OTHER") || errorMessage.includes("OTHER")) {
+      throw new Error("Das Bild konnte nicht generiert werden. Bitte nutze ein schärferes Foto mit weniger Falten in der Kleidung.");
+    }
+    
+    throw new Error(error.message || "Fehler bei der Anprobe.");
+  }
 }
 
 export async function fileToBase64(file: File): Promise<string> {
@@ -124,25 +113,31 @@ export async function fileToBase64(file: File): Promise<string> {
     const reader = new FileReader();
     reader.readAsDataURL(file);
     reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
+    reader.onerror = (error) => reject(error);
   });
 }
 
 export async function urlToBase64(url: string): Promise<string> {
   if (url.startsWith('data:')) return url;
+
   return new Promise((resolve, reject) => {
     const img = new Image();
+    const proxiedUrl = `https://images.weserv.nl/?url=${encodeURIComponent(url)}`;
     img.crossOrigin = "anonymous";
     img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return reject(new Error("Canvas fail"));
-      ctx.drawImage(img, 0, 0);
-      resolve(canvas.toDataURL('image/jpeg', 0.8));
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error("Canvas Fail");
+        ctx.drawImage(img, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      } catch (err) {
+        reject(new Error(`Fehler bei Bildverarbeitung.`));
+      }
     };
-    img.onerror = () => reject(new Error("Produktbild Fehler"));
-    img.src = `https://images.weserv.nl/?url=${encodeURIComponent(url)}&w=1024&output=jpg`;
+    img.onerror = () => reject(new Error(`Produktbild konnte nicht geladen werden.`));
+    img.src = proxiedUrl;
   });
 }
