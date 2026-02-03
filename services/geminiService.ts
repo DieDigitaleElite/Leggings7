@@ -7,7 +7,12 @@ async function fetchWithRetry<T>(fn: () => Promise<T>, retries = 2, delay = 2000
   try {
     return await fn();
   } catch (error: any) {
-    const isRetryable = error.message?.includes("429") || error.status === 429 || error.message?.includes("quota");
+    const errorMsg = error.message || "";
+    // Falls der Key nicht gefunden wurde (Requested entity not found), zwingen wir den User zur Neuauswahl
+    if (errorMsg.includes("Requested entity was not found")) {
+      throw new Error("KEY_NOT_FOUND");
+    }
+    const isRetryable = errorMsg.includes("429") || error.status === 429;
     if (retries > 0 && isRetryable) {
       await new Promise(resolve => setTimeout(resolve, delay));
       return fetchWithRetry(fn, retries - 1, delay * 2);
@@ -49,13 +54,14 @@ function getCleanBase64(dataUrl: string): string {
 export async function estimateSizeFromImage(userBase64: string, productName: string): Promise<string> {
   return fetchWithRetry(async () => {
     const optimized = await optimizeImage(userBase64, 800);
+    // Initialisierung direkt vor dem Call für aktuellsten API-Key
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const response = await ai.models.generateContent({
       model: APP_CONFIG.TEXT_MODEL,
       contents: {
         parts: [
           { inlineData: { data: getCleanBase64(optimized), mimeType: "image/jpeg" } },
-          { text: `Analyse the person. Suggest a size (XS, S, M, L, XL, XXL) for "${productName}". Output only the size code.` },
+          { text: `Analyse the person's body type. Suggest a size (XS, S, M, L, XL, XXL) for the garment "${productName}". Output only the size code.` },
         ],
       },
     });
@@ -71,17 +77,22 @@ export async function performVirtualTryOn(userBase64: string, productBase64: str
     const optProduct = await optimizeImage(productBase64, 1024);
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
+    // Maximale Präzision für das Pro-Modell
     const promptText = `
-      MANDATORY TASK: Professional Virtual Try-On for a Fashion Store.
-      USER: Image 1. PRODUCT: Image 2.
-      PRODUCT DESCRIPTION: ${product.description}.
+      MANDATORY TASK: Perform a professional virtual fashion try-on.
+      USER PHOTO: Image 1.
+      PRODUCT PHOTO: Image 2.
       
-      CRITICAL INSTRUCTIONS:
-      1. This is a TWO-PIECE SET. You MUST dress the person in BOTH the top and the full-length leggings shown in Image 2.
-      2. Do NOT omit the pants/leggings. Ensure the full outfit is visible.
-      3. STICK EXACTLY to the color, fabric sheen, and distinctive seam patterns of the product.
-      4. Maintain the person's identity (face, hair) and the background of Image 1 perfectly.
-      5. The fit should be tight and athletic. Output ONLY the image.
+      PRODUCT INFO: This is a TWO-PIECE SET consisting of a Top/Bra and Leggings.
+      DETAILS: ${product.description}.
+      
+      RULES:
+      1. You MUST render the person in Image 1 wearing BOTH parts of the set from Image 2.
+      2. The leggings MUST be full-length and clearly visible.
+      3. Maintain the EXACT colors, seam lines, and material texture from Image 2.
+      4. Keep the person's face, hair, and original background from Image 1 100% identical.
+      5. The outfit must fit tightly and realistically to the person's body.
+      6. Return ONLY the final high-resolution image.
     `;
 
     const response = await ai.models.generateContent({
@@ -93,16 +104,18 @@ export async function performVirtualTryOn(userBase64: string, productBase64: str
           { text: promptText },
         ],
       },
-      config: { temperature: 0 }
+      config: { 
+        imageConfig: { aspectRatio: "3:4", imageSize: "1K" }
+      }
     });
 
     if (response.candidates?.[0]?.finishReason === 'SAFETY') {
-      throw new Error("Bild blockiert. Bitte wähle ein Foto mit neutraler Kleidung.");
+      throw new Error("Das Bild wurde aus Sicherheitsgründen blockiert. Bitte trage auf deinem Foto neutrale Kleidung.");
     }
 
     const part = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
     if (part?.inlineData?.data) return `data:image/jpeg;base64,${part.inlineData.data}`;
-    throw new Error("KI-Fehler. Bitte versuche es mit einem Ganzkörperfoto.");
+    throw new Error("KI konnte kein Bild generieren. Bitte versuche es mit einem deutlicheren Foto.");
   });
 }
 
